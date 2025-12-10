@@ -1,0 +1,15 @@
+[
+{
+  "modid": "configmigrator",
+  "name": "Config Migrator",
+  "description": "Helps migrate modified configuration values between Minecraft instances.",
+  "version": "${version}",
+  "mcversion": "${mcversion}",
+  "url": "https://github.com/Aedial/ConfigMigrator",
+  "authorList": ["Aedial"],
+  "credits": "",
+  "logoFile": "",
+  "screenshots": [],
+  "dependencies": []
+}
+]
