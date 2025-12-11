@@ -50,11 +50,23 @@ public class ConfigMigrator {
 
         configTracker = new ConfigTracker(minecraftDir, configDir);
 
+        // Capture defaults the modpack may be shipping with, before applying any migrations (to avoid capturing migrated values)
+        configTracker.captureDefaults();
+
         // Load existing migrations file and apply them immediately
-        // This happens before other mods' preInit, so their config reads will see our changes
-        // Safe to call even if config files don't exist yet - those are simply skipped
+        // NOTE: Forge loads config files before preInit, so migrations are applied to disk
+        // but won't take effect until the next restart
         configTracker.loadMigrationsFile();
-        configTracker.applyMigrations();
+        boolean migrationsApplied = configTracker.applyMigrations();
+
+        if (migrationsApplied) {
+            String separator = "================================================================================";
+            LOGGER.warn(separator);
+            LOGGER.warn("Config migrations have been applied to files on disk.");
+            LOGGER.warn("RESTART THE GAME for changes to take effect!");
+            LOGGER.warn("(Forge loads configs before mods can modify them)");
+            LOGGER.warn(separator);
+        }
     }
 
     @EventHandler

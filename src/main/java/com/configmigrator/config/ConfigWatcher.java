@@ -1,7 +1,5 @@
 package com.configmigrator.config;
 
-import com.configmigrator.ConfigMigrator;
-
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.*;
@@ -9,6 +7,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.configmigrator.ConfigMigrator;
+
 
 /**
  * Watches the config directory for changes and triggers updates to the migrations file.

@@ -90,7 +90,7 @@ public class ConfigTracker {
 
     private void profileEnd(double start, String operation) {
         if (PROFILING) {
-            double duration =  Math.round(((double) System.nanoTime() - start) / 100_000_000.0) * 100.0;
+            double duration =  Math.round(((double) System.nanoTime() - start) / 10_000.0) / 100.0;
             ConfigMigrator.LOGGER.info("[PROFILE] {} took {}ms", operation, duration);
         }
     }
@@ -204,11 +204,15 @@ public class ConfigTracker {
     /**
      * Applies pending migrations from configs.json to the actual config files.
      * Searches for keys anywhere in the file.
+     * 
+     * @return true if any migrations were applied
      */
-    public void applyMigrations() {
-        if (pendingMigrations == null || pendingMigrations.isEmpty()) return;
+    public boolean applyMigrations() {
+        if (pendingMigrations == null || pendingMigrations.isEmpty()) return false;
 
         ConfigMigrator.LOGGER.info("Applying config migrations...");
+
+        boolean anyMigrated = false;
 
         for (Map.Entry<String, Map<String, String>> entry : pendingMigrations.entrySet()) {
             String relativePath = entry.getKey();
@@ -226,9 +230,30 @@ public class ConfigTracker {
                 boolean modified = false;
                 Set<String> appliedKeys = new HashSet<>();
 
+                // Track section hierarchy for .cfg files
+                List<String> sectionStack = new ArrayList<>();
+
                 for (int i = 0; i < lines.size(); i++) {
                     String line = lines.get(i);
                     String trimmed = line.trim();
+
+                    // Track section hierarchy for .cfg files
+                    if (relativePath.endsWith(".cfg")) {
+                        // Section start: "sectionName {"
+                        if (trimmed.endsWith("{") && !trimmed.startsWith("#")) {
+                            String sectionName = trimmed.substring(0, trimmed.length() - 1).trim();
+                            if (!sectionName.isEmpty()) {
+                                sectionStack.add(sectionName);
+                                continue;
+                            }
+                        }
+
+                        // Section end: "}"
+                        if (trimmed.equals("}") && !sectionStack.isEmpty()) {
+                            sectionStack.remove(sectionStack.size() - 1);
+                            continue;
+                        }
+                    }
 
                     // Handle Forge multi-line arrays: S:key <
                     if (relativePath.endsWith(".cfg") && trimmed.endsWith("<")) {
@@ -236,9 +261,10 @@ public class ConfigTracker {
                         if (eqIndex < 0) continue;
 
                         String key = trimmed.substring(0, eqIndex).trim();
-                        if (!keyValueChanges.containsKey(key)) continue;
+                        String fullKey = buildFullKey(sectionStack, key);
+                        if (!keyValueChanges.containsKey(fullKey)) continue;
 
-                        String newValue = keyValueChanges.get(key);
+                        String newValue = keyValueChanges.get(fullKey);
                         if (!newValue.startsWith("<")) continue; // Not a multi-line array value
 
                         // Find the end of the current array (line with just >)
@@ -270,16 +296,19 @@ public class ConfigTracker {
                         i = arrayStart + newArrayLines.size() - 1;
 
                         modified = true;
-                        appliedKeys.add(key);
-                        ConfigMigrator.LOGGER.debug("Applied migration for array key '{}' in {}", key, relativePath);
+                        appliedKeys.add(fullKey);
+                        ConfigMigrator.LOGGER.debug("Applied migration for array key '{}' in {}", fullKey, relativePath);
                         continue;
                     }
 
                     // Handle regular key=value lines
                     String key = extractKey(line, relativePath);
-                    if (key == null || !keyValueChanges.containsKey(key)) continue;
+                    if (key == null) continue;
 
-                    String newValue = keyValueChanges.get(key);
+                    String fullKey = relativePath.endsWith(".cfg") ? buildFullKey(sectionStack, key) : key;
+                    if (!keyValueChanges.containsKey(fullKey)) continue;
+
+                    String newValue = keyValueChanges.get(fullKey);
                     if (newValue.startsWith("<")) continue; // Multi-line array, handled above
 
                     String newLine = replaceValue(line, newValue, relativePath);
@@ -287,8 +316,8 @@ public class ConfigTracker {
                     if (newLine != null && !newLine.equals(line)) {
                         lines.set(i, newLine);
                         modified = true;
-                        appliedKeys.add(key);
-                        ConfigMigrator.LOGGER.debug("Applied migration for key '{}' in {}", key, relativePath);
+                        appliedKeys.add(fullKey);
+                        ConfigMigrator.LOGGER.debug("Applied migration for key '{}' in {}", fullKey, relativePath);
                     }
                 }
 
@@ -308,7 +337,7 @@ public class ConfigTracker {
                     long newModTime = Files.getLastModifiedTime(configPath).toMillis();
                     fileMetadata.put(relativePath, new FileMetadata(newHash, newModTime));
 
-                    // The migrated values are user modifications and will be tracked as such
+                    anyMigrated = true;
                 }
             } catch (IOException e) {
                 ConfigMigrator.LOGGER.error("Failed to apply migration to {}: {}", relativePath, e.getMessage());
@@ -319,6 +348,8 @@ public class ConfigTracker {
 
         // Save updated metadata only - defaults should not change
         saveMetadata();
+
+        return anyMigrated;
     }
 
     /**
@@ -636,9 +667,30 @@ public class ConfigTracker {
     private Map<String, String> parseConfigLines(List<String> lines, String relativePath) {
         Map<String, String> keyValues = new LinkedHashMap<>();
 
+        // Track section hierarchy for Forge .cfg files
+        List<String> sectionStack = new ArrayList<>();
+
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
             String trimmed = line.trim();
+
+            // Track section hierarchy for .cfg files
+            if (relativePath.endsWith(".cfg")) {
+                // Section start: "sectionName {"
+                if (trimmed.endsWith("{") && !trimmed.startsWith("#")) {
+                    String sectionName = trimmed.substring(0, trimmed.length() - 1).trim();
+                    if (!sectionName.isEmpty()) {
+                        sectionStack.add(sectionName);
+                        continue;
+                    }
+                }
+
+                // Section end: "}"
+                if (trimmed.equals("}") && !sectionStack.isEmpty()) {
+                    sectionStack.remove(sectionStack.size() - 1);
+                    continue;
+                }
+            }
 
             // Handle Forge multi-line arrays: S:key <
             if (relativePath.endsWith(".cfg") && trimmed.endsWith("<")) {
@@ -659,7 +711,9 @@ public class ConfigTracker {
                     i++;
                 }
 
-                keyValues.put(key, arrayValue.toString());
+                // Build full hierarchical key
+                String fullKey = buildFullKey(sectionStack, key);
+                keyValues.put(fullKey, arrayValue.toString());
                 continue;
             }
 
@@ -667,10 +721,25 @@ public class ConfigTracker {
             if (key == null) continue;
 
             String value = extractValue(line, relativePath);
-            if (value != null) keyValues.put(key, value);
+            if (value != null) {
+                // Build full hierarchical key for .cfg files
+                String fullKey = relativePath.endsWith(".cfg") ? buildFullKey(sectionStack, key) : key;
+                keyValues.put(fullKey, value);
+            }
         }
 
         return keyValues;
+    }
+
+    private String buildFullKey(List<String> sectionStack, String key) {
+        if (sectionStack.isEmpty()) return key;
+
+        StringBuilder fullKey = new StringBuilder();
+        for (String section : sectionStack) {
+            fullKey.append(section).append(".");
+        }
+        fullKey.append(key);
+        return fullKey.toString();
     }
 
     private void loadMetadata() {
