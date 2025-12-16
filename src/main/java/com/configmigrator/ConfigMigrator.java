@@ -2,12 +2,11 @@ package com.configmigrator;
 
 import com.configmigrator.config.ConfigTracker;
 import com.configmigrator.config.ConfigWatcher;
-import com.configmigrator.command.ForceUpdateCommand;
+import com.configmigrator.config.ModConfig;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.Mod.EventHandler;
 import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
 import net.minecraftforge.fml.common.event.FMLPostInitializationEvent;
-import net.minecraftforge.fml.common.event.FMLServerStartingEvent;
 import net.minecraftforge.fml.common.event.FMLServerStoppingEvent;
 import org.apache.logging.log4j.Logger;
 
@@ -26,17 +25,19 @@ import java.io.File;
     name = ConfigMigrator.NAME,
     version = ConfigMigrator.VERSION,
     acceptableRemoteVersions = "*",
-    dependencies = "before:*"
+    dependencies = "before:*",
+    guiFactory = "com.configmigrator.config.ConfigGuiFactory"
 )
 public class ConfigMigrator {
     public static final String MODID = "configmigrator";
     public static final String NAME = "Config Migrator";
-    public static final String VERSION = "1.0.0";
+    public static final String VERSION = "1.1.0";
 
     public static Logger LOGGER;
     public static File minecraftDir;
     public static File configDir;
 
+    private static ModConfig modConfig;
     private static ConfigTracker configTracker;
     private static ConfigWatcher configWatcher;
 
@@ -48,6 +49,10 @@ public class ConfigMigrator {
 
         LOGGER.info("Config Migrator initializing...");
 
+        // Load our own config first
+        File modConfigFile = new File(configDir, MODID + ".cfg");
+        ModConfig.init(modConfigFile);
+
         configTracker = new ConfigTracker(minecraftDir, configDir);
 
         // Capture defaults the modpack may be shipping with, before applying any migrations (to avoid capturing migrated values)
@@ -58,6 +63,9 @@ public class ConfigMigrator {
         // but won't take effect until the next restart
         configTracker.loadMigrationsFile();
         boolean migrationsApplied = configTracker.applyMigrations();
+
+        // Reload our config to ensure any migrated values are reflected in-memory
+        ModConfig.syncFromFile();
 
         if (migrationsApplied) {
             String separator = "================================================================================";
@@ -74,16 +82,16 @@ public class ConfigMigrator {
         // Re-capture defaults after all mods have initialized their configs
         configTracker.captureDefaults();
 
+        // Perform initial scan: detect all current differences and write configs.json
+        // Force full scan to establish the baseline (bypass timestamp optimization)
+        configTracker.detectChangesAndSave(true);
+        LOGGER.info("Initial config scan complete");
+
         // Start watching for config changes
         configWatcher = new ConfigWatcher(configDir, configTracker);
         configWatcher.start();
 
         LOGGER.info("Config Migrator initialized successfully");
-    }
-
-    @EventHandler
-    public void serverStarting(FMLServerStartingEvent event) {
-        event.registerServerCommand(new ForceUpdateCommand());
     }
 
     @EventHandler

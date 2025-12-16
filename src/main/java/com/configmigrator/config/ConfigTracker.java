@@ -13,8 +13,6 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -36,20 +34,18 @@ public class ConfigTracker {
     private static final String MIGRATIONS_FILE = "configs.json";
     private static final String DEFAULTS_DIR = "configmigrator";
     private static final String DEFAULTS_ZIP = "defaults.zip";
-    private static final String METADATA_FILE = "metadata.zip";
     private static final boolean PROFILING = Boolean.getBoolean("configmigrator.profile");
 
     private final File configDir;
     private final File migrationsFile;
     private final File defaultsDir;
     private final File defaultsZip;
-    private final File metadataFile;
 
     private final Gson gson;
 
     /**
-     * Metadata about each config file: MD5 hash and last known modification time.
-     * Used to detect if a file changed (offline or online).
+     * In-memory metadata: MD5 hash and last known modification time.
+     * Built at startup, maintained during runtime. Never persisted to disk.
      */
     private final Map<String, FileMetadata> fileMetadata = new ConcurrentHashMap<>();
 
@@ -75,7 +71,6 @@ public class ConfigTracker {
         this.migrationsFile = new File(minecraftDir, MIGRATIONS_FILE);
         this.defaultsDir = new File(configDir, DEFAULTS_DIR);
         this.defaultsZip = new File(defaultsDir, DEFAULTS_ZIP);
-        this.metadataFile = new File(defaultsDir, METADATA_FILE);
 
         this.gson = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
@@ -126,8 +121,7 @@ public class ConfigTracker {
     public void captureDefaults() {
         double start = profileStart();
         loadDefaults();
-        loadMetadata();
-        profileEnd(start, "Load defaults and metadata");
+        profileEnd(start, "Load defaults");
 
         int newFilesCaptured = 0;
 
@@ -146,8 +140,7 @@ public class ConfigTracker {
         if (newFilesCaptured > 0) {
             start = profileStart();
             saveDefaults();
-            saveMetadata();
-            profileEnd(start, "Save defaults and metadata");
+            profileEnd(start, "Save defaults");
             ConfigMigrator.LOGGER.info("Captured defaults for {} new config files", newFilesCaptured);
         }
     }
@@ -163,9 +156,6 @@ public class ConfigTracker {
 
     private boolean captureDefaultIfNeeded(Path configPath) {
         String relativePath = configDir.toPath().relativize(configPath).toString().replace('\\', '/');
-
-        // Skip our own files
-        if (relativePath.startsWith(DEFAULTS_DIR + "/")) return false;
 
         try {
             String currentHash = computeMD5(configPath);
@@ -186,11 +176,9 @@ public class ConfigTracker {
             // Just update metadata if it's missing
             if (existing == null) {
                 fileMetadata.put(relativePath, new FileMetadata(currentHash, currentModTime));
-                ConfigMigrator.LOGGER.debug("Updated metadata for existing defaults: {}", relativePath);
             } else if (!existing.md5Hash.equals(currentHash)) {
                 // File changed - update metadata only, defaults stay immutable
                 fileMetadata.put(relativePath, new FileMetadata(currentHash, currentModTime));
-                ConfigMigrator.LOGGER.debug("File changed, updated metadata: {}", relativePath);
             }
 
             return false;
@@ -217,6 +205,12 @@ public class ConfigTracker {
         for (Map.Entry<String, Map<String, String>> entry : pendingMigrations.entrySet()) {
             String relativePath = entry.getKey();
             Map<String, String> keyValueChanges = entry.getValue();
+
+            // Special handling for our own config: merge ignored keys instead of replacing
+            if (relativePath.equals(ConfigMigrator.MODID + ".cfg")) {
+                applyModConfigMigrations(keyValueChanges);
+                continue;
+            }
 
             Path configPath = configDir.toPath().resolve(relativePath);
 
@@ -346,42 +340,149 @@ public class ConfigTracker {
 
         pendingMigrations = null;
 
-        // Save updated metadata only - defaults should not change
-        saveMetadata();
-
         return anyMigrated;
     }
 
     /**
+     * Special handling for our own mod config migrations.
+     * For ignored keys arrays, we merge and dedupe instead of replacing.
+     */
+    private void applyModConfigMigrations(Map<String, String> keyValueChanges) {
+        for (Map.Entry<String, String> entry : keyValueChanges.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+
+            // Check if this is the ignoredKeys array
+            if (key.equals("general.ignoredKeys") || key.endsWith(".ignoredKeys")) {
+                // Parse the array value and merge into config
+                if (value.startsWith("<") && value.endsWith(">")) {
+                    String[] lines = value.split("\n");
+                    List<String> newKeys = new ArrayList<>();
+
+                    for (String line : lines) {
+                        String trimmed = line.trim();
+                        if (!trimmed.equals("<") && !trimmed.equals(">") && !trimmed.isEmpty()) {
+                            newKeys.add(trimmed);
+                        }
+                    }
+
+                    if (!newKeys.isEmpty()) {
+                        ModConfig.mergeIgnoredKeys(newKeys.toArray(new String[0]));
+                        ConfigMigrator.LOGGER.info("Merged {} ignored key patterns into mod config", newKeys.size());
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * Detects changes from defaults and saves to configs.json.
+     * Call with forceFullScan=true on initial startup to build the baseline.
      */
     public synchronized void detectChangesAndSave() {
+        detectChangesAndSave(false, null);
+    }
+
+    /**
+     * Detects changes from defaults and saves to configs.json.
+     * 
+     * @param forceFullScan if true, forces full re-parsing of all files (used on initial startup)
+     */
+    public synchronized void detectChangesAndSave(boolean forceFullScan) {
+        detectChangesAndSave(forceFullScan, null);
+    }
+
+    /**
+     * Detects changes for specific files plus checks for new files, then saves.
+     * 
+     * @param dirtyFiles set of relative paths to files that changed
+     */
+    public synchronized void detectChangesAndSave(Set<String> dirtyFiles) {
+        detectChangesAndSave(false, dirtyFiles);
+    }
+
+    /**
+     * Detects changes from defaults and saves to configs.json.
+     * 
+     * @param forceFullScan if true, forces full re-parsing of all files
+     * @param dirtyFiles if non-null, only check these specific files (plus detect new files)
+     */
+    private synchronized void detectChangesAndSave(boolean forceFullScan, Set<String> dirtyFiles) {
         double start = profileStart();
-        modifiedConfigs.clear();
+        
+        // Preserve previous modifications for unchanged files (timestamp fast-path)
+        Map<String, Map<String, String>> previousModifications = forceFullScan ? 
+            new ConcurrentHashMap<>() : new ConcurrentHashMap<>(modifiedConfigs);
+        
+        // If checking specific dirty files, preserve all non-dirty files' modifications
+        if (dirtyFiles != null && !forceFullScan) {
+            modifiedConfigs.clear();
+            // Restore all non-dirty files immediately
+            for (Map.Entry<String, Map<String, String>> entry : previousModifications.entrySet()) {
+                if (!dirtyFiles.contains(entry.getKey())) {
+                    modifiedConfigs.put(entry.getKey(), entry.getValue());
+                }
+            }
+        } else {
+            modifiedConfigs.clear();
+        }
 
         try {
-            Files.walk(configDir.toPath())
-                .filter(Files::isRegularFile)
-                .filter(this::isConfigFile)
-                .filter(this::isNotInDefaultsDir)
-                .forEach(this::detectChanges);
+            if (dirtyFiles != null) {
+                // Check only dirty files + scan for new files
+                for (String relativePath : dirtyFiles) {
+                    Path configPath = configDir.toPath().resolve(relativePath);
+                    if (Files.exists(configPath)) {
+                        detectChanges(configPath, previousModifications, forceFullScan);
+                    }
+                }
+                // Also check for new files not in defaults
+                checkForNewFiles(previousModifications, forceFullScan);
+            } else {
+                // Full scan of all files
+                Files.walk(configDir.toPath())
+                    .filter(Files::isRegularFile)
+                    .filter(this::isConfigFile)
+                    .filter(this::isNotInDefaultsDir)
+                    .forEach(path -> detectChanges(path, previousModifications, forceFullScan));
+            }
         } catch (IOException e) {
             ConfigMigrator.LOGGER.error("Failed to walk config directory: {}", e.getMessage());
             return;
         }
 
-        profileEnd(start, "Detect all config changes");
+        profileEnd(start, "Detect config changes");
 
         start = profileStart();
         saveMigrationsFile();
         profileEnd(start, "Save migrations file");
-
-        start = profileStart();
-        saveMetadata();
-        profileEnd(start, "Save metadata");
     }
 
-    private void detectChanges(Path configPath) {
+    /**
+     * Checks for new config files that don't have defaults yet.
+     */
+    private void checkForNewFiles(Map<String, Map<String, String>> previousModifications, boolean forceFullScan) {
+        try {
+            Files.walk(configDir.toPath())
+                .filter(Files::isRegularFile)
+                .filter(this::isConfigFile)
+                .filter(this::isNotInDefaultsDir)
+                .forEach(path -> {
+                    String relativePath = configDir.toPath().relativize(path).toString().replace('\\', '/');
+                    // If we don't have defaults for this file, it's new
+                    if (!defaultConfigs.containsKey(relativePath)) {
+                        ConfigMigrator.LOGGER.info("Detected new config file: {}", relativePath);
+                        captureDefaultIfNeeded(path);
+                        // Also check it for changes
+                        detectChanges(path, previousModifications, forceFullScan);
+                    }
+                });
+        } catch (IOException e) {
+            ConfigMigrator.LOGGER.warn("Failed to check for new files: {}", e.getMessage());
+        }
+    }
+
+    private void detectChanges(Path configPath, Map<String, Map<String, String>> previousModifications, boolean forceFullScan) {
         String relativePath = configDir.toPath().relativize(configPath).toString().replace('\\', '/');
 
         // Skip our own files
@@ -396,31 +497,27 @@ public class ConfigTracker {
             long currentModTime = Files.getLastModifiedTime(configPath).toMillis();
             FileMetadata metadata = fileMetadata.get(relativePath);
 
-            // Fast path: if modification time hasn't changed, file is definitely unchanged
-            if (metadata != null && metadata.lastModified == currentModTime) {
-                // No need to re-parse, file hasn't changed
-                // Check if we had modifications tracked before
-                Map<String, String> current = parseConfigFile(configPath, relativePath);
-                Map<String, String> changes = new LinkedHashMap<>();
-
-                for (Map.Entry<String, String> entry : current.entrySet()) {
-                    String key = entry.getKey();
-                    String currentValue = entry.getValue();
-                    String defaultValue = defaults.get(key);
-
-                    if (defaultValue != null && !defaultValue.equals(currentValue)) changes.put(key, currentValue);
+            // Fast path: if modification time hasn't changed AND not forcing full scan, file is definitely unchanged
+            if (!forceFullScan && metadata != null && metadata.lastModified == currentModTime) {
+                // File hasn't been touched - preserve any existing tracked changes
+                // This prevents losing keys when another config file changes but this one doesn't
+                Map<String, String> existingChanges = previousModifications.get(relativePath);
+                if (existingChanges != null && !existingChanges.isEmpty()) {
+                    modifiedConfigs.put(relativePath, existingChanges);
                 }
-
-                if (!changes.isEmpty()) modifiedConfigs.put(relativePath, changes);
-
                 return;
             }
 
-            // Timestamp changed - verify with MD5 to catch timestamp-only changes
+            // Timestamp changed (or forcing full scan) - verify with MD5 to catch timestamp-only changes
             String currentHash = computeMD5(configPath);
-            if (metadata != null && metadata.md5Hash.equals(currentHash)) {
-                // Just update the timestamp
+            if (!forceFullScan && metadata != null && metadata.md5Hash.equals(currentHash)) {
+                // Just update the timestamp, content hasn't changed
                 fileMetadata.put(relativePath, new FileMetadata(currentHash, currentModTime));
+                // Still preserve existing changes
+                Map<String, String> existingChanges = previousModifications.get(relativePath);
+                if (existingChanges != null && !existingChanges.isEmpty()) {
+                    modifiedConfigs.put(relativePath, existingChanges);
+                }
                 return;
             }
 
@@ -432,6 +529,9 @@ public class ConfigTracker {
                 String key = entry.getKey();
                 String currentValue = entry.getValue();
                 String defaultValue = defaults.get(key);
+
+                // Skip ignored keys (caches, timestamps, etc.)
+                if (ModConfig.shouldIgnoreKey(key)) continue;
 
                 if (defaultValue != null && !defaultValue.equals(currentValue)) changes.put(key, currentValue);
             }
@@ -507,21 +607,27 @@ public class ConfigTracker {
 
         if (filePath.endsWith(".cfg") || filePath.endsWith(".properties")) {
             int eqIndex = trimmed.indexOf('=');
-            if (eqIndex > 0 && eqIndex < trimmed.length() - 1) return trimmed.substring(eqIndex + 1).trim();
+            if (eqIndex > 0) {
+                // Handle empty values: key= should return ""
+                if (eqIndex == trimmed.length() - 1) return "";
+                return trimmed.substring(eqIndex + 1).trim();
+            }
         } else if (filePath.endsWith(".toml")) {
             int eqIndex = trimmed.indexOf('=');
-            if (eqIndex > 0 && eqIndex < trimmed.length() - 1) return trimmed.substring(eqIndex + 1).trim();
-
-            return eqIndex == trimmed.length() - 1 ? "" : null;
+            if (eqIndex > 0) {
+                if (eqIndex == trimmed.length() - 1) return "";
+                return trimmed.substring(eqIndex + 1).trim();
+            }
         } else if (filePath.endsWith(".conf")) {
             int eqIndex = trimmed.indexOf('=');
             int colonIndex = trimmed.indexOf(':');
             int sepIndex = (eqIndex > 0 && colonIndex > 0) ? Math.min(eqIndex, colonIndex) :
                            (eqIndex > 0 ? eqIndex : colonIndex);
 
-            if (sepIndex > 0 && sepIndex < trimmed.length() - 1) return trimmed.substring(sepIndex + 1).trim();
-
-            return sepIndex == trimmed.length() - 1 ? "" : null;
+            if (sepIndex > 0) {
+                if (sepIndex == trimmed.length() - 1) return "";
+                return trimmed.substring(sepIndex + 1).trim();
+            }
         }
 
         return null;
@@ -574,18 +680,30 @@ public class ConfigTracker {
     }
 
     private void saveMigrationsFile() {
-        if (modifiedConfigs.isEmpty()) {
-            if (migrationsFile.exists()) {
-                migrationsFile.delete();
-                ConfigMigrator.LOGGER.info("No config modifications detected, removed migrations file");
-            }
+        // Check if there are actual changes compared to what's on disk
+        Map<String, Map<String, String>> existingMigrations = null;
 
+        if (migrationsFile.exists()) {
+            try (Reader reader = new InputStreamReader(new FileInputStream(migrationsFile), StandardCharsets.UTF_8)) {
+                Type type = new TypeToken<Map<String, Map<String, String>>>(){}.getType();
+                existingMigrations = gson.fromJson(reader, type);
+            } catch (Exception e) {
+                ConfigMigrator.LOGGER.warn("Failed to read existing migrations file for comparison: {}", e.getMessage());
+            }
+        }
+
+        // Compare current state with existing state
+        if (existingMigrations != null && existingMigrations.equals(modifiedConfigs)) {
+            // No changes, don't save
             return;
         }
 
+        // State has changed, save it
         try (Writer writer = new OutputStreamWriter(new FileOutputStream(migrationsFile), StandardCharsets.UTF_8)) {
             gson.toJson(modifiedConfigs, writer);
-            ConfigMigrator.LOGGER.info("Saved {} modified configs to {}", modifiedConfigs.size(), MIGRATIONS_FILE);
+            if (!modifiedConfigs.isEmpty()) {
+                ConfigMigrator.LOGGER.info("Saved {} modified configs to {}", modifiedConfigs.size(), MIGRATIONS_FILE);
+            }
         } catch (IOException e) {
             ConfigMigrator.LOGGER.error("Failed to save migrations file: {}", e.getMessage());
         }
@@ -740,42 +858,6 @@ public class ConfigTracker {
         }
         fullKey.append(key);
         return fullKey.toString();
-    }
-
-    private void loadMetadata() {
-        if (!metadataFile.exists()) return;
-
-        try (Reader reader = new InputStreamReader(new GZIPInputStream(new FileInputStream(metadataFile)), StandardCharsets.UTF_8)) {
-            Type type = new TypeToken<Map<String, FileMetadata>>(){}.getType();
-            Map<String, FileMetadata> loaded = gson.fromJson(reader, type);
-
-            if (loaded != null) {
-                fileMetadata.putAll(loaded);
-                ConfigMigrator.LOGGER.debug("Loaded metadata for {} config files", loaded.size());
-            }
-        } catch (Exception e) {
-            // Try loading as uncompressed (backwards compatibility)
-            try (Reader reader = new InputStreamReader(new FileInputStream(metadataFile), StandardCharsets.UTF_8)) {
-                Type type = new TypeToken<Map<String, FileMetadata>>(){}.getType();
-                Map<String, FileMetadata> loaded = gson.fromJson(reader, type);
-
-                if (loaded != null) {
-                    fileMetadata.putAll(loaded);
-                    ConfigMigrator.LOGGER.debug("Loaded metadata for {} config files (uncompressed)", loaded.size());
-                }
-            } catch (Exception e2) {
-                ConfigMigrator.LOGGER.warn("Failed to load metadata file: {}", e2.getMessage());
-            }
-        }
-    }
-
-    private void saveMetadata() {
-        try (Writer writer = new OutputStreamWriter(new GZIPOutputStream(new FileOutputStream(metadataFile)), StandardCharsets.UTF_8)) {
-            gson.toJson(fileMetadata, writer);
-            ConfigMigrator.LOGGER.debug("Saved metadata for {} config files (compressed)", fileMetadata.size());
-        } catch (IOException e) {
-            ConfigMigrator.LOGGER.error("Failed to save metadata file: {}", e.getMessage());
-        }
     }
 
     /**

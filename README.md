@@ -24,10 +24,34 @@ Config Migrator attempts to match config keys based on their paths and names. Ho
 Deleted or missing values will not be saved in `configs.json`, so keeping backups of the file before moving between instances is recommended.
 
 ### How often does the mod check for config changes?
-By default, the mod updates within a minute of a change, or every 10 minutes. It also saves changes upon exit, and you can use the `/cmforceupdate` command to force an immediate update, in-game. The process itself is lightweight, taking 100-200ms on average for huge modpacks (400+ configs, megabytes of text).
+By default, the mod detects any change within 30s of a change, and also does a check upon exit. The process itself is lightweight, taking 100-200ms on average for huge modpacks (400+ configs, megabytes of text).
 
 ### I messed up, how can I reset the defaults?
-Simply delete the content of minecraft/config/configmigrator/. Do note that it will lose track of your modified configs as well, considering them as current default. You should restore the configs to their original default values before doing so, if you want to track modifications again, or manually edit defaults.zip to restore the original defaults.
+Simply delete the content of minecraft/config/configmigrator/. Do note that it will lose track of your modified configs as well, considering them as current default. You should restore the configs to their original default values, before doing so, if you want to track modifications again, or manually edit defaults.zip to restore the original defaults.
+
+## Configuration (configmigrator.cfg)
+
+Config Migrator has a small config file `config/configmigrator.cfg` with one main option: `ignoredKeys`.
+
+- `ignoredKeys` (list): keys to ignore when detecting and saving modifications. Use it for configs that change often but are useless to migrate, like timestamps, cached data, or version checks.
+
+Wildcard patterns are supported:
+
+- `prefix.*` matches any key starting with `prefix.` (e.g. `cache.*`)
+- `*.suffix` matches any key ending with `.suffix` (e.g. `*.lastCheck`)
+- `prefix.*.suffix` supports matching keys with variable middle sections
+
+Examples:
+
+```
+general {
+    S:ignoredKeys <
+        cache.S:lastCheck
+        cache.S:digest
+        module.versioncheck.general.I:versionSave
+    >
+}
+```
 
 ## Building
 Run:

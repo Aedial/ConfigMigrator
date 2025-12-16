@@ -1,0 +1,3 @@
+config.configmigrator.general=Config Migrator
+config.configmigrator.ignoredKeys=Ignored keys
+config.configmigrator.ignoredKeys.comment=List of config keys to ignore when tracking changes. Use hierarchical keys for .cfg files (e.g., 'cache.S:lastCheck'). Useful for cache values, timestamps, and other auto-generated values that shouldn't be migrated.
