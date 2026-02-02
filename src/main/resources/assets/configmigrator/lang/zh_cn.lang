@@ -1,0 +1,3 @@
+config.configmigrator.general=配置迁移器
+config.configmigrator.ignoredKeys=忽略的键
+config.configmigrator.ignoredKeys.comment=追踪更改时，需要忽略的配置键列表。对 .cfg 文件使用层级键（例如：'cache.S:lastCheck'）。适用于缓存值、时间戳及其他不应迁移的自动生成值。
